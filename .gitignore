@@ -4,3 +4,8 @@ __pycache__/
 edge_profile/
 seen_shows.json
 .DS_Store
+
+# Environment and sensitive local files
+.env
+.env.*
+!.env.example

@@ -4,20 +4,59 @@ import re
 import json
 import os
 import sys
+import html
 import winsound
 import requests
 from playwright.sync_api import sync_playwright
 
-# ==================== CONFIGURATION ====================
-TELEGRAM_BOT_TOKEN = "9240366318:AAFxev3gxJYJEtF4A9rwAF4nRlaNmsw70P8"
-TELEGRAM_CHAT_ID = "1836867995"
+# ==================== ENVIRONMENT CONFIGURATION ====================
+def load_env_file(filepath=None):
+    """Lightweight .env loader without external dependencies."""
+    if filepath is None:
+        filepath = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(filepath):
+        return
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip("\"'").strip()
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception as e:
+        print(f"[!] Warning: Could not read .env: {e}")
+
+load_env_file()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL_SECONDS = 90  # Check every 90 seconds
 
 BMS_BUY_URL = "https://in.bookmyshow.com/buytickets/avengers-doomsday-hyderabad/movie-hyd-ET00439706-MT/20261217"
 DISTRICT_URL = "https://www.district.in/movies/avengers-doomsday-movie-tickets-in-hyderabad-MV176735"
 
 SEEN_FILE = os.path.join(os.path.dirname(__file__), "seen_shows.json")
-# =======================================================
+# ===================================================================
+
+def mask_token(text: str, token: str) -> str:
+    """Mask token from any string before logging to prevent accidental credential leakage."""
+    if token and token in text:
+        return text.replace(token, "[REDACTED_BOT_TOKEN]")
+    return text
+
+def validate_credentials():
+    """Verify that required credentials are set; fail safely if missing."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        sys.exit(
+            "[!] CONFIGURATION ERROR: Missing required credentials.\n"
+            "    Please configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID\n"
+            "    either in your environment or in a .env file.\n"
+            "    See .env.example for template."
+        )
 
 def load_seen():
     if os.path.exists(SEEN_FILE):
@@ -33,6 +72,7 @@ def save_seen(seen):
         json.dump(list(seen), f)
 
 def send_telegram_alert(message):
+    validate_credentials()
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -44,11 +84,13 @@ def send_telegram_alert(message):
         resp = requests.post(url, json=payload, timeout=10)
         data = resp.json()
         if not data.get("ok"):
-            print(f"[!] Telegram send error: {data.get('description')}")
+            err_desc = mask_token(str(data.get("description")), TELEGRAM_BOT_TOKEN)
+            print(f"[!] Telegram send error: {err_desc}")
             return False
         return True
     except Exception as e:
-        print(f"[!] Telegram request failed: {e}")
+        safe_err = mask_token(str(e), TELEGRAM_BOT_TOKEN)
+        print(f"[!] Telegram request failed: {safe_err}")
         return False
 
 def sound_alarm():
@@ -131,7 +173,36 @@ def check_district(page, seen):
         
     return found_shows
 
+def format_telegram_alert(bms_shows, district_shows):
+    """Format and HTML-escape telegram alert message."""
+    msg_lines = [
+        "🚨 <b>TICKETS ALERT: 12 AM SHOWS FOUND!</b> 🚨\n",
+        "<b>Movie:</b> Avengers: Doomsday",
+        "<b>Date:</b> December 17, 2026",
+        "<b>City:</b> Hyderabad\n"
+    ]
+    
+    if bms_shows:
+        msg_lines.append("🎟️ <b>BookMyShow Shows:</b>")
+        for v, t in bms_shows:
+            clean_v = html.escape(str(v))
+            clean_t = html.escape(str(t))
+            msg_lines.append(f"• <b>{clean_t}</b> at {clean_v}")
+        msg_lines.append(f'<a href="{BMS_BUY_URL}">👉 Click Here to Book on BookMyShow</a>\n')
+        
+    if district_shows:
+        msg_lines.append("🎟️ <b>District Shows:</b>")
+        for v, t in district_shows:
+            clean_v = html.escape(str(v))
+            clean_t = html.escape(str(t))
+            msg_lines.append(f"• <b>{clean_t}</b> at {clean_v}")
+        msg_lines.append(f'<a href="{DISTRICT_URL}">👉 Click Here to Book on District</a>\n')
+        
+    return "\n".join(msg_lines)
+
 def main():
+    validate_credentials()
+    
     print("=" * 60)
     print(" 🍿 AVENGERS: DOOMSDAY (Dec 17) - 12 AM SHOWS TICKET NOTIFIER")
     print(" City: Hyderabad")
@@ -166,26 +237,7 @@ def main():
                 save_seen(seen)
                 sound_alarm()
                 
-                msg_lines = [
-                    "🚨 <b>TICKETS ALERT: 12 AM SHOWS FOUND!</b> 🚨\n",
-                    "<b>Movie:</b> Avengers: Doomsday",
-                    "<b>Date:</b> December 17, 2026",
-                    "<b>City:</b> Hyderabad\n"
-                ]
-                
-                if bms_new:
-                    msg_lines.append("🎟️ <b>BookMyShow Shows:</b>")
-                    for v, t in bms_new:
-                        msg_lines.append(f"• <b>{t}</b> at {v}")
-                    msg_lines.append(f'<a href="{BMS_BUY_URL}">👉 Click Here to Book on BookMyShow</a>\n')
-                    
-                if district_new:
-                    msg_lines.append("🎟️ <b>District Shows:</b>")
-                    for v, t in district_new:
-                        msg_lines.append(f"• <b>{t}</b> at {v}")
-                    msg_lines.append(f'<a href="{DISTRICT_URL}">👉 Click Here to Book on District</a>\n')
-                    
-                full_msg = "\n".join(msg_lines)
+                full_msg = format_telegram_alert(bms_new, district_new)
                 print("\n" + "!" * 50)
                 print("💥 12 AM SHOWS DETECTED! SENDING ALERT...")
                 print("!" * 50)
@@ -193,7 +245,7 @@ def main():
                 if sent:
                     print("✅ Telegram notification sent successfully!")
                 else:
-                    print("❌ Failed to send Telegram alert (check chat_id / bot start).")
+                    print("❌ Failed to send Telegram alert.")
             else:
                 print("  -> No 12 AM shows released yet.")
                 
