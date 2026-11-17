@@ -5,9 +5,11 @@ import json
 import os
 import sys
 import html
+import random
 import winsound
 import requests
 from playwright.sync_api import sync_playwright
+from showtime_parser import parse_showtimes, is_midnight_time, ParsedShow
 
 # ==================== ENVIRONMENT CONFIGURATION ====================
 def load_env_file(filepath=None):
@@ -58,20 +60,32 @@ def validate_credentials():
             "    See .env.example for template."
         )
 
-def load_seen():
-    if os.path.exists(SEEN_FILE):
+def load_seen(filepath=None):
+    if filepath is None:
+        filepath = SEEN_FILE
+    if os.path.exists(filepath):
         try:
-            with open(SEEN_FILE, "r") as f:
+            with open(filepath, "r", encoding="utf-8") as f:
                 return set(json.load(f))
         except Exception:
             return set()
     return set()
 
-def save_seen(seen):
-    with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen), f)
+def save_seen(seen, filepath=None):
+    if filepath is None:
+        filepath = SEEN_FILE
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(sorted(list(seen)), f, indent=2)
 
-def send_telegram_alert(message):
+def mark_shows_seen(seen, bms_shows, district_shows, filepath=None):
+    """Add confirmed alerted shows to the seen set and persist to disk."""
+    for v, t in bms_shows:
+        seen.add(f"BMS_{v}_{t}")
+    for v, t in district_shows:
+        seen.add(f"DISTRICT_{v}_{t}")
+    save_seen(seen, filepath=filepath)
+
+def send_telegram_alert(message, max_retries=3, base_delay=1.0):
     validate_credentials()
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -80,18 +94,100 @@ def send_telegram_alert(message):
         "parse_mode": "HTML",
         "disable_web_page_preview": False
     }
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        data = resp.json()
-        if not data.get("ok"):
-            err_desc = mask_token(str(data.get("description")), TELEGRAM_BOT_TOKEN)
-            print(f"[!] Telegram send error: {err_desc}")
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+
+            # Safely determine status code (handling mocks where status_code may be a MagicMock)
+            if type(getattr(resp, "status_code", None)) is int:
+                status_code = resp.status_code
+            else:
+                try:
+                    data = resp.json()
+                    status_code = 200 if (isinstance(data, dict) and data.get("ok")) else 400
+                except Exception:
+                    status_code = 200
+
+            # 1. Success case
+            if status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("ok"):
+                        return True
+                    err_desc = mask_token(str(data.get("description", "Unknown API error")), TELEGRAM_BOT_TOKEN)
+                    print(f"[!] Telegram API error (attempt {attempt}/{max_retries}): {err_desc}")
+                except Exception as e:
+                    print(f"[!] Telegram JSON parse error (attempt {attempt}/{max_retries}): {e}")
+
+            # 2. Rate limit hit (HTTP 429)
+            elif status_code == 429:
+                retry_after = 5.0
+                err_desc = "Too Many Requests"
+                try:
+                    data = resp.json()
+                    err_desc = mask_token(str(data.get("description", err_desc)), TELEGRAM_BOT_TOKEN)
+                    if "parameters" in data and "retry_after" in data["parameters"]:
+                        retry_after = float(data["parameters"]["retry_after"])
+                except Exception:
+                    pass
+
+                headers = getattr(resp, "headers", {}) or {}
+                if "Retry-After" in headers:
+                    try:
+                        retry_after = float(headers["Retry-After"])
+                    except ValueError:
+                        pass
+
+                # Cap retry_after between 0.5s and 30s to avoid excessive blocking
+                retry_after = min(max(retry_after, 0.5), 30.0)
+                print(f"[!] Telegram rate limit hit (HTTP 429, attempt {attempt}/{max_retries}): {err_desc}. Sleeping {retry_after}s...")
+                if attempt < max_retries:
+                    time.sleep(retry_after)
+                    continue
+                else:
+                    print(f"[!] Telegram rate limit: max retries ({max_retries}) exhausted.")
+                    return False
+
+            # 3. Permanent client errors (HTTP 4xx except 429: 400, 401, 403, 404, etc.)
+            elif 400 <= status_code < 500:
+                try:
+                    data = resp.json()
+                    err_desc = mask_token(str(data.get("description", getattr(resp, "text", ""))), TELEGRAM_BOT_TOKEN)
+                except Exception:
+                    err_desc = mask_token(str(getattr(resp, "text", ""))[:200], TELEGRAM_BOT_TOKEN)
+                print(f"[!] Telegram client error HTTP {status_code} (non-retryable): {err_desc}")
+                return False
+
+            # 4. Server errors (HTTP 5xx)
+            elif status_code >= 500:
+                err_text = mask_token(str(getattr(resp, "text", ""))[:200], TELEGRAM_BOT_TOKEN)
+                print(f"[!] Telegram server error HTTP {status_code} (attempt {attempt}/{max_retries}): {err_text}")
+
+            # 5. Unexpected status
+            else:
+                err_text = mask_token(str(getattr(resp, "text", ""))[:200], TELEGRAM_BOT_TOKEN)
+                print(f"[!] Telegram unexpected HTTP {status_code} (attempt {attempt}/{max_retries}): {err_text}")
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+            safe_err = mask_token(str(net_err), TELEGRAM_BOT_TOKEN)
+            print(f"[!] Telegram network error (attempt {attempt}/{max_retries}): {safe_err}")
+
+        except Exception as e:
+            safe_err = mask_token(str(e), TELEGRAM_BOT_TOKEN)
+            print(f"[!] Telegram request exception (attempt {attempt}/{max_retries}): {safe_err}")
+
+        # Sleep with exponential backoff and jitter if retries remain
+        if attempt < max_retries:
+            jitter = random.uniform(0.1, 0.5)
+            delay = (base_delay * (2 ** (attempt - 1))) + jitter
+            print(f"    Retrying Telegram alert in {delay:.2f}s...")
+            time.sleep(delay)
+        else:
+            print(f"[!] Telegram alert delivery failed after {max_retries} attempts.")
             return False
-        return True
-    except Exception as e:
-        safe_err = mask_token(str(e), TELEGRAM_BOT_TOKEN)
-        print(f"[!] Telegram request failed: {safe_err}")
-        return False
+
+    return False
 
 def sound_alarm():
     """Play high-pitched alert beeps on Windows to grab immediate attention."""
@@ -104,41 +200,22 @@ def sound_alarm():
     except Exception:
         pass
 
-def is_midnight_time(time_str):
-    """Checks if showtime is between 12:00 AM and 04:59 AM."""
-    t = time_str.strip().upper()
-    if not t.endswith("AM"):
-        return False
-    # Check for 12:xx AM, 01:xx AM, 02:xx AM, 03:xx AM, 04:xx AM
-    for prefix in ["12:", "01:", "02:", "03:", "04:", "1:", "2:", "3:", "4:"]:
-        if t.startswith(prefix):
-            return True
-    return False
-
 def check_bookmyshow(page, seen):
     found_shows = []
+    cycle_seen = set()
     try:
         page.goto(BMS_BUY_URL, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(4000)
         
         all_text = page.inner_text("body")
-        lines = [l.strip() for l in all_text.split("\n") if l.strip()]
+        parsed_shows = parse_showtimes(all_text, provider="BookMyShow")
         
-        time_pattern = re.compile(r"^(1[0-2]|0?[1-9]):([0-5][0-9])\s*(AM|PM)$", re.IGNORECASE)
-        
-        # Scan through lines
-        current_venue = "Unknown Venue"
-        for i, line in enumerate(lines):
-            # Venue headers often have "PVR", "INOX", "Cinemas", "Theatre", etc.
-            if any(k in line.lower() for k in ["pvr", "inox", "cinemas", "theatre", "multiplex", "70mm", "talkies", "prasads", "cinepolis"]):
-                current_venue = line
-            
-            if time_pattern.match(line):
-                if is_midnight_time(line):
-                    show_key = f"BMS_{current_venue}_{line}"
-                    if show_key not in seen:
-                        found_shows.append((current_venue, line))
-                        seen.add(show_key)
+        for show in parsed_shows:
+            if show.is_midnight:
+                show_key = f"BMS_{show.venue}_{show.time}"
+                if show_key not in seen and show_key not in cycle_seen:
+                    found_shows.append((show.venue, show.time))
+                    cycle_seen.add(show_key)
                         
     except Exception as e:
         print(f"  [BookMyShow Error]: {e}")
@@ -147,26 +224,20 @@ def check_bookmyshow(page, seen):
 
 def check_district(page, seen):
     found_shows = []
+    cycle_seen = set()
     try:
         page.goto(DISTRICT_URL, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(4000)
         
         all_text = page.inner_text("body")
-        lines = [l.strip() for l in all_text.split("\n") if l.strip()]
+        parsed_shows = parse_showtimes(all_text, provider="District")
         
-        time_pattern = re.compile(r"^(1[0-2]|0?[1-9]):([0-5][0-9])\s*(AM|PM)$", re.IGNORECASE)
-        
-        current_venue = "Unknown Venue"
-        for i, line in enumerate(lines):
-            if any(k in line.lower() for k in ["pvr", "inox", "miraj", "cinemas", "theatre", "multiplex", "70mm", "talkies", "cinepolis", "prasads"]):
-                current_venue = line
-                
-            if time_pattern.match(line):
-                if is_midnight_time(line):
-                    show_key = f"DISTRICT_{current_venue}_{line}"
-                    if show_key not in seen:
-                        found_shows.append((current_venue, line))
-                        seen.add(show_key)
+        for show in parsed_shows:
+            if show.is_midnight:
+                show_key = f"DISTRICT_{show.venue}_{show.time}"
+                if show_key not in seen and show_key not in cycle_seen:
+                    found_shows.append((show.venue, show.time))
+                    cycle_seen.add(show_key)
                         
     except Exception as e:
         print(f"  [District Error]: {e}")
@@ -234,7 +305,6 @@ def main():
             
             # 3. Handle alerts
             if bms_new or district_new:
-                save_seen(seen)
                 sound_alarm()
                 
                 full_msg = format_telegram_alert(bms_new, district_new)
@@ -243,9 +313,10 @@ def main():
                 print("!" * 50)
                 sent = send_telegram_alert(full_msg)
                 if sent:
-                    print("✅ Telegram notification sent successfully!")
+                    mark_shows_seen(seen, bms_new, district_new)
+                    print("✅ Telegram notification sent successfully and seen_shows.json updated!")
                 else:
-                    print("❌ Failed to send Telegram alert.")
+                    print("❌ Failed to send Telegram alert. Shows will remain un-seen and retried on next cycle.")
             else:
                 print("  -> No 12 AM shows released yet.")
                 

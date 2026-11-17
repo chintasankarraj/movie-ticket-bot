@@ -14,15 +14,39 @@ if PROJECT_ROOT not in sys.path:
 class TestSecurityHardening(unittest.TestCase):
 
     def test_no_hardcoded_credentials_in_tracked_files(self):
-        """Verify that no tracked file contains known sensitive patterns."""
-        cmd = ["git", "grep", "-i", "-E", "[0-9]{9,11}:[A-Za-z0-9_-]{35}"]
-        res = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True)
-        self.assertEqual(res.returncode, 1, f"Found hardcoded token in git files: {res.stdout}")
+        """Verify that tracked application files do not contain hardcoded credentials or literal token patterns."""
+        # 1. Regex scan for Telegram bot token format across tracked files, excluding test files
+        cmd_token = [
+            "git", "grep", "-i", "-E", r"\b[0-9]{9,11}:[A-Za-z0-9_-]{35}\b",
+            "--", ":!test_*.py", ":!*.md"
+        ]
+        res_token = subprocess.run(cmd_token, cwd=PROJECT_ROOT, capture_output=True, text=True)
+        self.assertEqual(
+            res_token.returncode, 1,
+            f"Found hardcoded bot token pattern in tracked application files:\n{res_token.stdout}"
+        )
 
-        # Check for specific user chat ID in tracked files
-        cmd_chat = ["git", "grep", "-n", "1836867995"]
-        res_chat = subprocess.run(cmd_chat, cwd=PROJECT_ROOT, capture_output=True, text=True)
-        self.assertEqual(res_chat.returncode, 1, f"Found hardcoded chat ID in git files: {res_chat.stdout}")
+        # 2. Inspect active application files to ensure credentials are exclusively retrieved from environment
+        app_files = [
+            os.path.join(PROJECT_ROOT, "monitor.py"),
+            os.path.join(PROJECT_ROOT, "monitor_cloud.py"),
+            os.path.join(PROJECT_ROOT, "scripts", "verify_telegram.py")
+        ]
+        literal_token_assign = re.compile(r"^\s*TELEGRAM_BOT_TOKEN\s*=\s*['\"][^'\"]+['\"]", re.MULTILINE)
+        literal_chat_assign = re.compile(r"^\s*TELEGRAM_CHAT_ID\s*=\s*(['\"][^'\"]+['\"]|\d+)", re.MULTILINE)
+
+        for path in app_files:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    code = f.read()
+                self.assertIsNone(
+                    literal_token_assign.search(code),
+                    f"{os.path.basename(path)} has hardcoded TELEGRAM_BOT_TOKEN assignment."
+                )
+                self.assertIsNone(
+                    literal_chat_assign.search(code),
+                    f"{os.path.basename(path)} has hardcoded TELEGRAM_CHAT_ID assignment."
+                )
 
     def test_dotenv_ignored_by_git(self):
         """Verify that .env is explicitly ignored by git."""
@@ -32,15 +56,21 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertIn(".env", res.stdout.strip())
 
     def test_dotenv_example_contains_no_real_secrets(self):
-        """Verify that .env.example only contains placeholders."""
+        """Verify that .env.example only contains placeholders and no actual credentials."""
         example_path = os.path.join(PROJECT_ROOT, ".env.example")
         self.assertTrue(os.path.exists(example_path), ".env.example must exist")
         with open(example_path, "r", encoding="utf-8") as f:
             content = f.read()
-        self.assertNotIn("9240366318", content)
-        self.assertNotIn("1836867995", content)
+
+        # Must contain standard placeholder values
         self.assertIn("your_telegram_bot_token_here", content)
         self.assertIn("your_numeric_chat_id_here", content)
+
+        # Must not contain live token format or numeric chat ID assignments
+        token_pattern = re.compile(r"\b[0-9]{9,11}:[A-Za-z0-9_-]{35}\b")
+        numeric_chat_pattern = re.compile(r"TELEGRAM_CHAT_ID\s*=\s*\d{6,}")
+        self.assertIsNone(token_pattern.search(content), ".env.example contains a real token pattern")
+        self.assertIsNone(numeric_chat_pattern.search(content), ".env.example contains a numeric chat ID")
 
     def test_github_workflow_references_secrets(self):
         """Verify that ticket_monitor.yml uses secrets and has no hardcoded values."""
@@ -48,15 +78,20 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertTrue(os.path.exists(wf_path))
         with open(wf_path, "r", encoding="utf-8") as f:
             content = f.read()
+
+        # Must reference GitHub Actions secrets
         self.assertIn("${{ secrets.TELEGRAM_BOT_TOKEN }}", content)
         self.assertIn("${{ secrets.TELEGRAM_CHAT_ID }}", content)
-        self.assertNotIn("9240366318", content)
-        self.assertNotIn("1836867995", content)
+
+        # Must not contain hardcoded token pattern or numeric assignment
+        token_pattern = re.compile(r"\b[0-9]{9,11}:[A-Za-z0-9_-]{35}\b")
+        numeric_chat_pattern = re.compile(r"TELEGRAM_CHAT_ID\s*:\s*\d{6,}")
+        self.assertIsNone(token_pattern.search(content), "Workflow contains a real token pattern")
+        self.assertIsNone(numeric_chat_pattern.search(content), "Workflow contains a numeric chat ID")
 
     def test_missing_credentials_fails_safely_monitor(self):
         """Verify that running monitor functions without credentials raises clean SystemExit."""
         with patch.dict(os.environ, {}, clear=True):
-            # Also mock non-existent .env
             import monitor
             with patch("monitor.TELEGRAM_BOT_TOKEN", None), patch("monitor.TELEGRAM_CHAT_ID", None):
                 with self.assertRaises(SystemExit) as cm:

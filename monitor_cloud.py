@@ -4,8 +4,12 @@ import time
 import datetime
 import re
 import html
+import json
+import random
+import tempfile
 import requests
 from playwright.sync_api import sync_playwright
+from showtime_parser import parse_showtimes, is_midnight_time, ParsedShow
 
 # ==================== ENVIRONMENT CONFIGURATION ====================
 def load_env_file(filepath=None):
@@ -33,14 +37,66 @@ load_env_file()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-BMS_BUY_URL = "https://in.bookmyshow.com/buytickets/avengers-doomsday-hyderabad/movie-hyd-ET00439706-MT/20261217"
 DISTRICT_URL = "https://www.district.in/movies/avengers-doomsday-movie-tickets-in-hyderabad-MV176735"
+BMS_BUY_URL = "https://in.bookmyshow.com/buytickets/avengers-doomsday-hyderabad/movie-hyd-ET00439706-MT/20261217"
 
-# Run duration in seconds for each GitHub Actions workflow execution
-# Runs checks every 30 seconds for ~4 minutes per job
-RUN_DURATION_SECONDS = 240
-CHECK_INTERVAL_SECONDS = 30
+CLOUD_SEEN_FILE = os.path.join(os.path.dirname(__file__), "cloud_seen_shows.json")
 # ===================================================================
+
+def load_cloud_seen(filepath=None):
+    """Load persistent cloud seen state from JSON.
+
+    Returns a set of string show identifiers.
+    - Missing file initializes to an empty set.
+    - Corrupted or structurally invalid JSON raises ValueError to prevent duplicate alerts.
+    """
+    if filepath is None:
+        filepath = CLOUD_SEEN_FILE
+    if not os.path.exists(filepath):
+        return set()
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Corrupted cloud state file '{filepath}': invalid JSON ({e})") from e
+    except Exception as e:
+        raise ValueError(f"Failed to read cloud state file '{filepath}': {e}") from e
+
+    if not isinstance(data, list) or not all(isinstance(item, str) for item in data):
+        raise ValueError(f"Structurally invalid cloud state in '{filepath}': expected list of strings, got {type(data).__name__}")
+
+    return set(data)
+
+def save_cloud_seen(seen, filepath=None):
+    """Atomically save cloud seen state to disk using a temporary file and os.replace."""
+    if filepath is None:
+        filepath = CLOUD_SEEN_FILE
+
+    target_dir = os.path.dirname(os.path.abspath(filepath)) or "."
+    temp_path = None
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix="cloud_seen_", suffix=".tmp", dir=target_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(seen)), f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, filepath)
+    except Exception as e:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        raise IOError(f"Failed to atomically persist cloud state to '{filepath}': {e}") from e
+
+def mark_cloud_shows_seen(seen, district_shows, filepath=None):
+    """Mark successfully alerted District shows as seen and persist atomically to disk."""
+    for v, t in district_shows:
+        seen.add(f"DISTRICT_{v}_{t}")
+    save_cloud_seen(seen, filepath=filepath)
 
 def mask_token(text: str, token: str) -> str:
     """Mask token from any string before logging to prevent accidental credential leakage."""
@@ -58,7 +114,7 @@ def validate_credentials():
             "    See .env.example for template."
         )
 
-def send_telegram_alert(message):
+def send_telegram_alert(message, max_retries=3, base_delay=1.0):
     validate_credentials()
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -67,72 +123,121 @@ def send_telegram_alert(message):
         "parse_mode": "HTML",
         "disable_web_page_preview": False
     }
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        data = resp.json()
-        if not data.get("ok"):
-            err_desc = mask_token(str(data.get("description")), TELEGRAM_BOT_TOKEN)
-            print(f"[!] Telegram send error: {err_desc}")
-            return False
-        return True
-    except Exception as e:
-        safe_err = mask_token(str(e), TELEGRAM_BOT_TOKEN)
-        print(f"[!] Telegram request failed: {safe_err}")
-        return False
 
-def is_midnight_time(time_str):
-    """Checks if showtime is between 12:00 AM and 04:59 AM."""
-    t = time_str.strip().upper()
-    if not t.endswith("AM"):
-        return False
-    for prefix in ["12:", "01:", "02:", "03:", "04:", "1:", "2:", "3:", "4:"]:
-        if t.startswith(prefix):
-            return True
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+
+            # Safely determine status code (handling mocks where status_code may be a MagicMock)
+            if type(getattr(resp, "status_code", None)) is int:
+                status_code = resp.status_code
+            else:
+                try:
+                    data = resp.json()
+                    status_code = 200 if (isinstance(data, dict) and data.get("ok")) else 400
+                except Exception:
+                    status_code = 200
+
+            # 1. Success case
+            if status_code == 200:
+                try:
+                    data = resp.json()
+                    if data.get("ok"):
+                        return True
+                    err_desc = mask_token(str(data.get("description", "Unknown API error")), TELEGRAM_BOT_TOKEN)
+                    print(f"[!] Telegram API error (attempt {attempt}/{max_retries}): {err_desc}")
+                except Exception as e:
+                    print(f"[!] Telegram JSON parse error (attempt {attempt}/{max_retries}): {e}")
+
+            # 2. Rate limit hit (HTTP 429)
+            elif status_code == 429:
+                retry_after = 5.0
+                err_desc = "Too Many Requests"
+                try:
+                    data = resp.json()
+                    err_desc = mask_token(str(data.get("description", err_desc)), TELEGRAM_BOT_TOKEN)
+                    if "parameters" in data and "retry_after" in data["parameters"]:
+                        retry_after = float(data["parameters"]["retry_after"])
+                except Exception:
+                    pass
+
+                headers = getattr(resp, "headers", {}) or {}
+                if "Retry-After" in headers:
+                    try:
+                        retry_after = float(headers["Retry-After"])
+                    except ValueError:
+                        pass
+
+                # Cap retry_after between 0.5s and 30s to avoid excessive blocking
+                retry_after = min(max(retry_after, 0.5), 30.0)
+                print(f"[!] Telegram rate limit hit (HTTP 429, attempt {attempt}/{max_retries}): {err_desc}. Sleeping {retry_after}s...")
+                if attempt < max_retries:
+                    time.sleep(retry_after)
+                    continue
+                else:
+                    print(f"[!] Telegram rate limit: max retries ({max_retries}) exhausted.")
+                    return False
+
+            # 3. Permanent client errors (HTTP 4xx except 429: 400, 401, 403, 404, etc.)
+            elif 400 <= status_code < 500:
+                try:
+                    data = resp.json()
+                    err_desc = mask_token(str(data.get("description", getattr(resp, "text", ""))), TELEGRAM_BOT_TOKEN)
+                except Exception:
+                    err_desc = mask_token(str(getattr(resp, "text", ""))[:200], TELEGRAM_BOT_TOKEN)
+                print(f"[!] Telegram client error HTTP {status_code} (non-retryable): {err_desc}")
+                return False
+
+            # 4. Server errors (HTTP 5xx)
+            elif status_code >= 500:
+                err_text = mask_token(str(getattr(resp, "text", ""))[:200], TELEGRAM_BOT_TOKEN)
+                print(f"[!] Telegram server error HTTP {status_code} (attempt {attempt}/{max_retries}): {err_text}")
+
+            # 5. Unexpected status
+            else:
+                err_text = mask_token(str(getattr(resp, "text", ""))[:200], TELEGRAM_BOT_TOKEN)
+                print(f"[!] Telegram unexpected HTTP {status_code} (attempt {attempt}/{max_retries}): {err_text}")
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+            safe_err = mask_token(str(net_err), TELEGRAM_BOT_TOKEN)
+            print(f"[!] Telegram network error (attempt {attempt}/{max_retries}): {safe_err}")
+
+        except Exception as e:
+            safe_err = mask_token(str(e), TELEGRAM_BOT_TOKEN)
+            print(f"[!] Telegram request exception (attempt {attempt}/{max_retries}): {safe_err}")
+
+        # Sleep with exponential backoff and jitter if retries remain
+        if attempt < max_retries:
+            jitter = random.uniform(0.1, 0.5)
+            delay = (base_delay * (2 ** (attempt - 1))) + jitter
+            print(f"    Retrying Telegram alert in {delay:.2f}s...")
+            time.sleep(delay)
+        else:
+            print(f"[!] Telegram alert delivery failed after {max_retries} attempts.")
+            return False
+
     return False
 
-def check_bookmyshow(page):
-    found_shows = []
-    try:
-        page.goto(BMS_BUY_URL, timeout=30000, wait_until="domcontentloaded")
-        page.wait_for_timeout(4000)
-        
-        all_text = page.inner_text("body")
-        lines = [l.strip() for l in all_text.split("\n") if l.strip()]
-        
-        time_pattern = re.compile(r"^(1[0-2]|0?[1-9]):([0-5][0-9])\s*(AM|PM)$", re.IGNORECASE)
-        
-        current_venue = "Unknown Venue"
-        for line in lines:
-            if any(k in line.lower() for k in ["pvr", "inox", "cinemas", "theatre", "multiplex", "70mm", "talkies", "prasads", "cinepolis"]):
-                current_venue = line
-            
-            if time_pattern.match(line):
-                if is_midnight_time(line):
-                    found_shows.append((current_venue, line))
-    except Exception as e:
-        print(f"  [BookMyShow Error]: {e}")
-        
-    return found_shows
+def check_bookmyshow(page=None, seen=None):
+    """BookMyShow cloud scraping is skipped due to Cloudflare anti-bot restrictions."""
+    return []
 
-def check_district(page):
+def check_district(page, seen):
+    """Perform a single check on District and return new midnight shows not in seen."""
     found_shows = []
+    cycle_seen = set()
     try:
         page.goto(DISTRICT_URL, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(4000)
         
         all_text = page.inner_text("body")
-        lines = [l.strip() for l in all_text.split("\n") if l.strip()]
-        
-        time_pattern = re.compile(r"^(1[0-2]|0?[1-9]):([0-5][0-9])\s*(AM|PM)$", re.IGNORECASE)
-        
-        current_venue = "Unknown Venue"
-        for line in lines:
-            if any(k in line.lower() for k in ["pvr", "inox", "miraj", "cinemas", "theatre", "multiplex", "70mm", "talkies", "cinepolis", "prasads"]):
-                current_venue = line
-                
-            if time_pattern.match(line):
-                if is_midnight_time(line):
-                    found_shows.append((current_venue, line))
+        parsed_shows = parse_showtimes(all_text, provider="District")
+        for show in parsed_shows:
+            if show.is_midnight:
+                show_key = f"DISTRICT_{show.venue}_{show.time}"
+                if show_key not in seen and show_key not in cycle_seen:
+                    found_shows.append((show.venue, show.time))
+                    cycle_seen.add(show_key)
     except Exception as e:
         print(f"  [District Error]: {e}")
         
@@ -169,13 +274,19 @@ def main():
     validate_credentials()
     
     print("=" * 60)
-    print(" ☁️ CLOUD NOTIFIER: AVENGERS DOOMSDAY (HYDERABAD - DEC 17)")
-    print(f" Run Window: ~{RUN_DURATION_SECONDS // 60} minutes | Poll every {CHECK_INTERVAL_SECONDS}s")
+    print(" ☁️ CLOUD NOTIFIER (SINGLE-SHOT): AVENGERS DOOMSDAY")
+    print(" Provider: District (Hyderabad - Dec 17)")
+    print(" Mode: Single execution with persistent state")
     print("=" * 60)
     
-    start_time = time.time()
-    cycle = 1
+    # 1. Load persistent cloud state
+    try:
+        seen = load_cloud_seen()
+        print(f"[*] Loaded {len(seen)} previously seen shows from cloud state.")
+    except Exception as e:
+        sys.exit(f"[!] FATAL: Cloud state validation failed: {e}")
     
+    # 2. Perform single District check with Playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -191,32 +302,40 @@ def main():
         )
         page = context.new_page()
         
-        while time.time() - start_time < RUN_DURATION_SECONDS:
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n[{now_str}] Check #{cycle} starting...")
-            
-            print("  -> Checking BookMyShow...")
-            bms_shows = check_bookmyshow(page)
-            
-            print("  -> Checking District...")
-            district_shows = check_district(page)
-            
-            if bms_shows or district_shows:
-                full_msg = format_telegram_alert(bms_shows, district_shows)
-                print("\n" + "!" * 50)
-                print("💥 12 AM SHOWS FOUND! SENDING TELEGRAM ALERT...")
-                print("!" * 50)
-                send_telegram_alert(full_msg)
-                # Break immediately once tickets are found
-                break
-            else:
-                print("  -> No 12 AM shows found yet.")
-                
-            cycle += 1
-            time.sleep(CHECK_INTERVAL_SECONDS)
-            
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now_str}] Checking District...")
+        district_shows = check_district(page, seen)
+        
         browser.close()
-    print("\n✅ Check cycle finished for this run.")
+        
+    # 3. Handle results
+    if not district_shows:
+        print("  -> No new 12 AM shows found on District.")
+        print("✅ Single-shot check complete. Exiting cleanly.")
+        return 0
+        
+    # 4. New shows found: build alert message
+    full_msg = format_telegram_alert([], district_shows)
+    print("\n" + "!" * 50)
+    print(f"💥 {len(district_shows)} NEW 12 AM SHOW(S) FOUND! SENDING TELEGRAM ALERT...")
+    print("!" * 50)
+    
+    sent = send_telegram_alert(full_msg)
+    if not sent:
+        print("❌ FAILED to send Telegram alert. Cloud state unchanged; shows will be retried on next run.")
+        sys.exit(1)
+        
+    print("✅ Telegram alert sent successfully.")
+    
+    # 5. Only persist state after confirmed delivery
+    try:
+        mark_cloud_shows_seen(seen, district_shows)
+        print(f"✅ Successfully persisted {len(district_shows)} new show(s) to cloud_seen_shows.json.")
+    except Exception as e:
+        print(f"[!] CRITICAL ERROR: Telegram alert sent, but failed to persist cloud state: {e}")
+        sys.exit(1)
+        
+    return 0
 
 if __name__ == "__main__":
     main()

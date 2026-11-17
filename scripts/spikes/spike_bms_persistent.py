@@ -1,7 +1,7 @@
 import os
 from playwright.sync_api import sync_playwright
 
-profile_dir = os.path.abspath("edge_profile")
+profile_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "edge_profile"))
 url = "https://in.bookmyshow.com/hyderabad/movies/avengers-doomsday/ET00439706"
 
 with sync_playwright() as p:

@@ -2,15 +2,22 @@ name: Avengers 12 AM Ticket Monitor
 
 on:
   schedule:
-    # Runs every 5 minutes automatically 24/7 in GitHub Cloud
-    - cron: '*/5 * * * *'
+    # Runs hourly at minute 37 in GitHub Cloud (single-shot execution)
+    - cron: '37 * * * *'
   workflow_dispatch:
     # Allows you to click "Run workflow" button manually anytime
+
+concurrency:
+  group: ticket-monitor-cloud
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
   check-tickets:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
       - name: Checkout Code
@@ -24,7 +31,6 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install --upgrade pip
           pip install -r requirements.txt
           playwright install chromium --with-deps
 
@@ -34,3 +40,17 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python monitor_cloud.py
+
+      - name: Commit and Push State
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add cloud_seen_shows.json
+          if ! git diff --staged --quiet; then
+            echo "[*] Changes detected in cloud_seen_shows.json. Committing state..."
+            git commit -m "chore: update cloud show deduplication state [skip ci]"
+            git push
+          else
+            echo "[*] No changes in cloud_seen_shows.json. Nothing to commit."
+          fi

@@ -5,8 +5,16 @@ import requests
 def load_env_file(filepath=None):
     """Lightweight .env loader without external dependencies."""
     if filepath is None:
-        filepath = os.path.join(os.path.dirname(__file__), ".env")
-    if not os.path.exists(filepath):
+        candidate_paths = [
+            os.path.join(os.path.dirname(__file__), ".env"),
+            os.path.join(os.path.dirname(__file__), "..", ".env"),
+            os.path.abspath(".env")
+        ]
+        for p in candidate_paths:
+            if os.path.exists(p):
+                filepath = p
+                break
+    if not filepath or not os.path.exists(filepath):
         return
     try:
         with open(filepath, "r", encoding="utf-8") as f:
