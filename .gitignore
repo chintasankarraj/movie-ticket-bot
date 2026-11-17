@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+edge_profile/
+seen_shows.json
+.DS_Store
