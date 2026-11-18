@@ -3,12 +3,12 @@
  * Read-only, hardcoded repository client with token sanitization and rate-limit safety
  */
 
-import { GITHUB_CONFIG, CLOUD_MONITOR_SPEC } from './config';
+import { GITHUB_CONFIG, CLOUD_MONITOR_SPEC } from './config.js';
 import {
   GitHubRunsResponseRaw,
   GitHubWorkflowRunRaw,
   GitHubContentFileRaw,
-} from './types';
+} from './types.js';
 
 // Declare Node's process.env safely without requiring @types/node
 declare const process: {

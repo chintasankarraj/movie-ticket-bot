@@ -4,11 +4,11 @@
  * parameter clamping, and zero token leakage.
  */
 
-import { handleOverviewRequest } from '../overview';
-import { handleWorkflowsRequest } from '../workflows';
-import { handleShowsRequest } from '../shows';
-import { memoryCache } from '../_lib/cache';
-import { GitHubApiError } from '../_lib/github';
+import { handleOverviewRequest } from '../overview.js';
+import { handleWorkflowsRequest } from '../workflows.js';
+import { handleShowsRequest } from '../shows.js';
+import { memoryCache } from '../_lib/cache.js';
+import { GitHubApiError } from '../_lib/github.js';
 
 declare const process: {
   env: Record<string, string | undefined>;

@@ -7,13 +7,13 @@ import {
   ShowsApiResponse,
   ParsedShowEntry,
   ApiErrorResponse,
-} from './_lib/types';
-import { memoryCache } from './_lib/cache';
+} from './_lib/types.js';
+import { memoryCache } from './_lib/cache.js';
 import {
   fetchCloudSeenShowsFile,
   getGitHubToken,
   GitHubApiError,
-} from './_lib/github';
+} from './_lib/github.js';
 
 /**
  * Parses raw deduplication keys such as:

@@ -7,19 +7,19 @@ import {
   OverviewApiResponse,
   WorkflowRunSummary,
   ApiErrorResponse,
-} from './_lib/types';
+} from './_lib/types.js';
 import {
   MOVIE_TARGET,
   CLOUD_MONITOR_SPEC,
   LOCAL_MONITOR_SPEC,
-} from './_lib/config';
-import { memoryCache } from './_lib/cache';
+} from './_lib/config.js';
+import { memoryCache } from './_lib/cache.js';
 import {
   fetchWorkflowRuns,
   fetchCloudSeenShowsFile,
   getGitHubToken,
   GitHubApiError,
-} from './_lib/github';
+} from './_lib/github.js';
 
 function calculateDurationSeconds(
   startStr?: string,

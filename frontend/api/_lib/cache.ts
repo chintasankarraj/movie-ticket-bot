@@ -3,8 +3,8 @@
  * High-resilience cache layer preventing upstream GitHub rate limit exhaustion
  */
 
-import { CACHE_CONFIG } from './config';
-import { CacheStatus } from './types';
+import { CACHE_CONFIG } from './config.js';
+import { CacheStatus } from './types.js';
 
 interface CacheRecord<T> {
   data: T;

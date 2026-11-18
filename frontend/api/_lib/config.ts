@@ -3,7 +3,7 @@
  * Fixed, hardcoded repository boundaries and security constants
  */
 
-import { MovieTargetConfig } from './types';
+import { MovieTargetConfig } from './types.js';
 
 export const GITHUB_CONFIG = {
   OWNER: 'chintasankarraj',
